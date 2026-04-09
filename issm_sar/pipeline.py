@@ -282,11 +282,10 @@ class ISSMSARPipeline:
                         vv_s3_uri=vv_s3_uri,
                         vh_s3_uri=vh_s3_uri,
                         geometry=aoi_geometry,
-                        bbox=aoi_bbox,
-                        start_datetime=period["period_start"],
-                        end_datetime=period["period_end"],
+                        period_start=period["period_start"],
+                        period_end=period["period_end"],
                         gsd=cogs["gsd"],
-                        collection=collection_name
+                        collection_id=collection_name
                     )
                     
                     # 4. POST to metadata server
