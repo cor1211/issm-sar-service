@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -85,22 +86,31 @@ def fetch_active_aois(
 
     logger.info("Querying ACTIVE AOIs from database (aoi_id=%s, limit=%s)", aoi_id, limit)
 
-    conn = pg8000.connect(
-        host=settings["PGHOST"],
-        port=int(settings["PGPORT"]),
-        user=settings["PGUSER"],
-        password=settings["PGPASSWORD"],
-        database=settings["PGDATABASE"],
-        timeout=8,
-    )
-    try:
-        cursor = conn.cursor()
-        cursor.execute("BEGIN READ ONLY")
-        cursor.execute(sql, params)
-        rows = cursor.fetchall()
-        cursor.execute("ROLLBACK")
-    finally:
-        conn.close()
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn = pg8000.connect(
+                host=settings["PGHOST"],
+                port=int(settings["PGPORT"]),
+                user=settings["PGUSER"],
+                password=settings["PGPASSWORD"],
+                database=settings["PGDATABASE"],
+                timeout=8,
+            )
+            try:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN READ ONLY")
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+                cursor.execute("ROLLBACK")
+            finally:
+                conn.close()
+            break
+        except Exception as e:
+            logger.error("DB Query failed (attempt %d/%d): %s", attempt + 1, max_retries, e)
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2)
 
     logger.info("Database returned %d AOI rows", len(rows))
 

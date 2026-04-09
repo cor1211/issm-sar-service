@@ -283,5 +283,5 @@ def export_masked_sr_band_cogs(
         "output_sr_vv_tif": str(vv_path),
         "output_sr_vh_tif": str(vh_path),
         "transform": list(dst_transform)[:6],
-        "gsd": abs(dst_transform.a),
+        "gsd": abs(transform.a), # MUST use original EPSG:3857 transform for meters
     }

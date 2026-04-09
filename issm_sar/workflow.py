@@ -59,6 +59,17 @@ def main():
     # 4. Batch Execute
     for aoi in aois:
         aoi_id = aoi["id"]
+        
+        # Determine output dir
+        aoi_out_dir = Path(args.output_dir) / aoi_id
+        aoi_out_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Setup File Logger for this specific AOI
+        log_file = aoi_out_dir / "job.log"
+        file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)-25s | %(message)s"))
+        logging.getLogger().addHandler(file_handler)
+        
         logger.info("========================================")
         logger.info("Starting AOI: %s (%s)", aoi_id, aoi.get("name", "Unnamed"))
         logger.info("========================================")
@@ -68,11 +79,26 @@ def main():
                 aoi_id=aoi_id,
                 aoi_geometry=aoi["geometry"],
                 datetime_range=datetime_range,
-                output_dir=Path(args.output_dir) / aoi_id
+                output_dir=aoi_out_dir
             )
-            logger.info("Completed AOI %s. Total periods processed: %d", aoi_id, len(results))
+            
+            # Write summary.json as requested
+            import json
+            summary_path = aoi_out_dir / "summary.json"
+            summary_data = {
+                "aoi_id": aoi_id,
+                "datetime_range": datetime_range,
+                "workflow_status": "COMPLETED",
+                "results": results
+            }
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary_data, f, indent=4)
+                
+            logger.info("Completed AOI %s. Saved summary.json. Total periods: %d", aoi_id, len(results))
         except Exception as e:
             logger.exception("Pipeline failed for AOI: %s", aoi_id)
+        finally:
+            logging.getLogger().removeHandler(file_handler)
 
 if __name__ == "__main__":
     main()

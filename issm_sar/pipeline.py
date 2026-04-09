@@ -252,27 +252,44 @@ class ISSMSARPipeline:
                 # D: CONTINUOUS PUBLISH
                 if self.publish_mode:
                     logger.info("Publish Mode ENABLED. Publishing period %s immediately...", period_id)
-                    s3_prefix = f"s3://{self.s3_output_bucket}/issm-sar/{aoi_id}/{period_id}"
                     
-                    # 1. Upload to S3
-                    vv_s3_uri = f"{s3_prefix}/{Path(vv_cog).name}"
-                    vh_s3_uri = f"{s3_prefix}/{Path(vh_cog).name}"
+                    # 1. Format exact IDs matching original packaging support
+                    collection_name = os.getenv("SR_COLLECTION_ID_MONTHLY", "sentinel-1sr-5m-monthly")
+                    
+                    def _norm(v):
+                        import re
+                        return re.sub(r"[^a-zA-Z0-9\-_]", "_", str(v)).strip("_")
+                        
+                    item_id = f"{_norm(collection_name)}_{_norm(period_id)}_{_norm(aoi_id)}"
+                    
+                    year, month = period_id.split("-")[:2]
+                    s3_prefix_base = os.getenv("SR_S3_PREFIX_MONTHLY", "issm-sar-sr-x2/monthly").strip("/")
+                    s3_folder_key = f"{s3_prefix_base}/{aoi_id}/{year}/{month}/{item_id}"
+                    
+                    vv_s3_key = f"{s3_folder_key}/{Path(vv_cog).name}"
+                    vh_s3_key = f"{s3_folder_key}/{Path(vh_cog).name}"
+                    
+                    vv_s3_uri = f"s3://{self.s3_output_bucket}/{vv_s3_key}"
+                    vh_s3_uri = f"s3://{self.s3_output_bucket}/{vh_s3_key}"
+                    
+                    # 2. Upload to S3
                     upload_to_s3(vv_cog, vv_s3_uri)
                     upload_to_s3(vh_cog, vh_s3_uri)
                     
-                    # 2. Create STAC Item
-                    item_id = f"ISSM_SAR_{aoi_id}_{period_id}"
+                    # 3. Create STAC Item
                     stac_item = create_stac_item(
                         item_id=item_id,
                         vv_s3_uri=vv_s3_uri,
                         vh_s3_uri=vh_s3_uri,
                         geometry=aoi_geometry,
-                        period_start=period["period_start"],
-                        period_end=period["period_end"],
-                        gsd=cogs["gsd"]
+                        bbox=aoi_bbox,
+                        start_datetime=period["period_start"],
+                        end_datetime=period["period_end"],
+                        gsd=cogs["gsd"],
+                        collection=collection_name
                     )
                     
-                    # 3. POST to metadata server
+                    # 4. POST to metadata server
                     publish_stac_item(stac_item, "issm-sar-sr-test")
                     logger.info("Publishing completed for %s", item_id)
                     
