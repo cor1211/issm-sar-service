@@ -1,0 +1,13 @@
+# Local STAC runtime dependencies (non-Docker).
+#
+# This is the recommended install set when running the STAC pipeline directly
+# on a normal machine. It intentionally excludes legacy GEE dependencies.
+#
+# Optional legacy GEE add-on:
+#   pip install -r requirements_gee.txt
+
+-r requirements_runtime_stac.txt
+
+# Needed explicitly on a plain machine. The Docker image gets torch from the
+# PyTorch base image instead of this file.
+torch==2.8.0

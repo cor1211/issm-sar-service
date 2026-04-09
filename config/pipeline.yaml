@@ -1,0 +1,21 @@
+stac:
+  url: "https://earth-search.aws.element84.com/v1"
+  collection: "sentinel-1-grd"
+  limit: 300
+
+trainlike:
+  target_crs: "EPSG:3857"
+  target_resolution: 10.0
+  resampling: "bilinear"
+  focal_median_radius_m: 15.0
+  auto_datetime_strategy: "previous_full_month"
+  auto_datetime_timezone: "Asia/Ho_Chi_Minh"
+  auto_datetime_months_back: 1
+  min_scenes_per_half: 1
+
+output:
+  root_dir: "data"
+  save_debug_artifacts: false
+
+logging:
+  level: "INFO"
