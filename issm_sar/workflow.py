@@ -5,8 +5,11 @@ import logging
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from issm_sar.config import (
     load_config,
+    load_yaml,
     setup_logging,
     apply_pipeline_env_overrides,
     apply_inference_env_overrides,
@@ -22,10 +25,15 @@ def main():
     parser = argparse.ArgumentParser(description="ISSM-SAR Inference Service")
     parser.add_argument("--config", default="config/pipeline.yaml", help="Path to pipeline.yaml")
     parser.add_argument("--aoi", help="Specific AOI UUID to process (defaults to all ACTIVE)")
-    parser.add_argument("--mode", help="Pipeline execute mode (stac_trainlike_composite, etc)")
+    parser.add_argument("--aoi-limit", type=int, help="Limit number of ACTIVE AOIs fetched from DB")
+    parser.add_argument("--geojson", help="Process a direct GeoJSON file instead of querying the DB")
     parser.add_argument("--target-month", help="Target month forced (YYYY-MM)")
+    parser.add_argument("--datetime", help="Explicit datetime range (e.g. 2023-01-01T00:00:00Z/2023-05-31T23:59:59Z)")
     parser.add_argument("--output-dir", default="runs/batch", help="Output directory")
     args = parser.parse_args()
+
+    # 0. Load .env FIRST — before any os.getenv() calls
+    load_dotenv()
 
     # 1. Configure and Load
     setup_logging()
@@ -35,9 +43,9 @@ def main():
     apply_cli_overrides(config, args)
 
     try:
-        inf_cfg = load_config(config["inference"]["config_path"])
+        inf_cfg = load_yaml(config["inference"]["config_path"])
         apply_inference_env_overrides(inf_cfg)
-        config.update(inf_cfg)
+        config["_inference_cfg"] = inf_cfg
     except Exception as e:
         logger.error("Failed to load inference config: %s", e)
         sys.exit(1)
@@ -45,13 +53,41 @@ def main():
     datetime_range, _ = resolve_datetime_range(config)
     logger.info("Resolved Datetime Range: %s", datetime_range)
 
-    # 2. Fetch Database AOIs
-    aois = fetch_active_aois(aoi_id=args.aoi)
-    if not aois:
-        logger.info("No active AOIs found. Exiting.")
-        return
-
-    logger.info("Found %d ACTIVE AOIs to process.", len(aois))
+    # 2. Fetch or Load AOIs
+    if args.geojson:
+        import json
+        import uuid
+        geojson_path = Path(args.geojson)
+        if not geojson_path.exists():
+            logger.error("GeoJSON file not found: %s", args.geojson)
+            return
+        with open(geojson_path, "r", encoding="utf-8") as f:
+            feat = json.load(f)
+        
+        # If it's a FeatureCollection, take the first feature
+        if feat.get("type") == "FeatureCollection":
+            features = feat.get("features", [])
+            if not features:
+                logger.error("GeoJSON FeatureCollection is empty.")
+                return
+            feat = features[0]
+            
+        geom = feat.get("geometry", feat)
+        fake_id = feat.get("properties", {}).get("id", str(uuid.uuid4()))
+        name = feat.get("properties", {}).get("name", geojson_path.stem)
+        
+        aois = [{
+            "id": fake_id,
+            "name": name,
+            "geometry": geom
+        }]
+        logger.info("Loaded 1 AOI from GeoJSON: %s", args.geojson)
+    else:
+        aois = fetch_active_aois(aoi_id=args.aoi, limit=args.aoi_limit)
+        if not aois:
+            logger.info("No active AOIs found in database. Exiting.")
+            return
+        logger.info("Found %d ACTIVE AOIs from database to process.", len(aois))
 
     # 3. Instantiate Pipeline Orchestrator
     pipeline = ISSMSARPipeline(config)

@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Union, Any, Dict, List, Optional
 from uuid import UUID
 
 from dotenv import load_dotenv
@@ -20,7 +20,7 @@ def normalize_aoi_uuid(aoi_id: str) -> str:
     return str(UUID(str(aoi_id).strip()))
 
 
-def _resolve_db_settings(env_path: str | Path = ".env") -> Dict[str, str]:
+def _resolve_db_settings(env_path: Union[str, Path] = ".env") -> Dict[str, str]:
     """Resolve PostgreSQL connection settings from environment / .env file."""
     load_dotenv(env_path)
     required_keys = ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE")
@@ -40,7 +40,7 @@ def fetch_active_aois(
     *,
     aoi_id: Optional[str] = None,
     limit: Optional[int] = None,
-    env_path: str | Path = ".env",
+    env_path: Union[str, Path] = ".env",
 ) -> List[Dict[str, Any]]:
     """Query ACTIVE AOIs from public.aois.
 
@@ -134,7 +134,7 @@ def fetch_active_aois(
 
 def materialize_aoi_geojson(
     record: Dict[str, Any],
-    output_dir: str | Path,
+    output_dir: Union[str, Path],
     filename: Optional[str] = None,
 ) -> Path:
     """Write an AOI record's geometry as a GeoJSON Feature file.

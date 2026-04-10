@@ -5,16 +5,21 @@ from __future__ import annotations
 import logging
 import math
 import warnings
+from affine import Affine
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Union, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import rasterio
+from pyproj import Transformer
+from shapely.geometry import mapping, shape
+from shapely.ops import unary_union
 from rasterio.crs import CRS
-from rasterio.transform import from_bounds
-from rasterio.warp import Resampling, calculate_default_transform, reproject
+from rasterio.warp import Resampling, calculate_default_transform, reproject, transform_geom
 from rasterio.mask import geometry_mask
 from scipy.ndimage import median_filter
+
+from issm_sar.stac_geometry import normalize_polygonal_geojson_geometry
 
 logger = logging.getLogger(__name__)
 
@@ -29,26 +34,43 @@ def resolve_resampling(name: str) -> Resampling:
         "bilinear": Resampling.bilinear,
         "cubic": Resampling.cubic,
         "average": Resampling.average,
+        "lanczos": Resampling.lanczos,
     }
-    return mapping.get(name, Resampling.bilinear)
+    if name not in mapping:
+        raise ValueError(f"Unsupported resampling mode: {name}")
+    return mapping[name]
 
 
 def build_target_grid(bbox: List[float], crs: str, xres: float, yres: float) -> Dict[str, Any]:
-    """Build a rasterio grid definition spanning a bbox at a specific resolution."""
-    minx, miny, maxx, maxy = bbox
-    width = int(math.ceil((maxx - minx) / abs(xres)))
-    height = int(math.ceil((maxy - miny) / abs(yres)))
-    transform = from_bounds(minx, miny, minx + width * abs(xres), miny - height * abs(yres), width, height)
+    """Build canonical metric grid from WGS84 bbox, snapped to target resolution."""
+    transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    minx, miny = transformer.transform(bbox[0], bbox[1])
+    maxx, maxy = transformer.transform(bbox[2], bbox[3])
+
+    xres = float(abs(xres))
+    yres = float(abs(yres))
+    left = math.floor(min(minx, maxx) / xres) * xres
+    right = math.ceil(max(minx, maxx) / xres) * xres
+    bottom = math.floor(min(miny, maxy) / yres) * yres
+    top = math.ceil(max(miny, maxy) / yres) * yres
+    width = max(1, int(round((right - left) / xres)))
+    height = max(1, int(round((top - bottom) / yres)))
+    transform = Affine(xres, 0.0, left, 0.0, -yres, top)
     return {
         "crs": crs,
         "transform": transform,
         "width": width,
         "height": height,
+        "xres": xres,
+        "yres": yres,
+        "left": left,
+        "right": right,
+        "bottom": bottom,
+        "top": top,
     }
 
-
 def align_single_band_to_grid(
-    path: str | Path,
+    path: Union[str, Path],
     grid: Dict[str, Any],
     resampling: Resampling,
     *,
@@ -76,15 +98,57 @@ def align_single_band_to_grid(
             dst_nodata=np.nan,
             resampling=resampling,
         )
-        if valid_min_db is not None and valid_max_db is not None:
-            dst[(dst < valid_min_db) | (dst > valid_max_db)] = np.nan
-            
-        # CLIP TỪNG CẢNH ĐƠN
+        if valid_min_db is not None:
+            dst[dst < valid_min_db] = np.nan
+        # Clip each aligned scene by AOI/component geometry (WGS84 -> target CRS).
         if valid_geometry:
-            mask = geometry_mask([valid_geometry], out_shape=(ref_height, ref_width), transform=ref_transform, invert=True)
-            dst[~mask] = np.nan
+            geom_wgs84 = normalize_polygonal_geojson_geometry(valid_geometry)
+            if geom_wgs84 is not None:
+                geom_ref = transform_geom(
+                    "EPSG:4326",
+                    ref_crs,
+                    geom_wgs84,
+                    antimeridian_cutting=True,
+                    precision=15,
+                )
+                geom_ref = normalize_polygonal_geojson_geometry(geom_ref)
+                if geom_ref is not None:
+                    mask = geometry_mask(
+                        [geom_ref],
+                        out_shape=(ref_height, ref_width),
+                        transform=ref_transform,
+                        invert=True,
+                    )
+                    dst[~mask] = np.nan
             
         return dst
+
+
+def geometry_mask_for_grid(
+    geometry_wgs84: Dict[str, Any],
+    grid: Dict[str, Any],
+) -> np.ndarray:
+    """Rasterize AOI geometry to a boolean valid mask on the target grid."""
+    ref_crs = CRS.from_user_input(grid["crs"])
+    geom_wgs84 = normalize_polygonal_geojson_geometry(geometry_wgs84)
+    if geom_wgs84 is None:
+        raise ValueError("Geometry mask requires a polygonal non-empty geometry.")
+    geom_ref = transform_geom(
+        "EPSG:4326",
+        ref_crs,
+        geom_wgs84,
+        antimeridian_cutting=True,
+        precision=15,
+    )
+    geom_ref = normalize_polygonal_geojson_geometry(geom_ref)
+    if geom_ref is None:
+        raise ValueError("Transformed geometry became empty on target grid.")
+    return geometry_mask(
+        [geom_ref],
+        out_shape=(int(grid["height"]), int(grid["width"])),
+        transform=grid["transform"],
+        invert=True,
+    ).astype(bool)
 
 
 # =============================================================================
@@ -119,6 +183,8 @@ def nanmedian_stack(arrays: List[np.ndarray]) -> np.ndarray:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         comp = np.nanmedian(stack, axis=0)
+    if np.all(np.isnan(comp)):
+        raise RuntimeError("Composite produced only NaN values.")
     if np.any(np.isnan(comp)):
         finite = comp[np.isfinite(comp)]
         fill_value = float(np.nanmedian(finite)) if finite.size else 0.0
@@ -158,10 +224,10 @@ def mosaic_component_sr_multibands_to_parent(
     target_crs: str,
     target_resolution: float,
     scale_factor: int = 2
-) -> Tuple[np.ndarray, Dict[str, Any]]:
+) -> Tuple[np.ndarray, Dict[str, Any], Optional[Dict[str, Any]]]:
     """Merge child SR outputs back onto one parent AOI canvas.
     Returns:
-       (parent_stack, parent_sr_grid)
+       (parent_stack, parent_sr_grid, supported_geometry_wgs84)
     where parent_stack has shape (2, height, width) [VV, VH]
     """
     if not component_sources:
@@ -173,6 +239,7 @@ def mosaic_component_sr_multibands_to_parent(
     
     parent_bands = np.full((2, dst_shape[0], dst_shape[1]), np.nan, dtype=np.float32)
     filled_mask = np.zeros(dst_shape, dtype=bool)
+    contributing_geometries: List[Any] = []
 
     # Sort components largest first
     def _rank(c): 
@@ -213,8 +280,21 @@ def mosaic_component_sr_multibands_to_parent(
         parent_bands[0, new_pixels] = warped_bands[0][new_pixels]
         parent_bands[1, new_pixels] = warped_bands[1][new_pixels]
         filled_mask[new_pixels] = True
+        comp_geom = component.get("geometry")
+        if comp_geom:
+            try:
+                contributing_geometries.append(shape(comp_geom))
+            except Exception:
+                pass
 
-    return parent_bands, parent_sr_grid
+    supported_geometry: Optional[Dict[str, Any]] = None
+    if contributing_geometries:
+        try:
+            supported_geometry = normalize_polygonal_geojson_geometry(mapping(unary_union(contributing_geometries)))
+        except Exception:
+            supported_geometry = None
+
+    return parent_bands, parent_sr_grid, supported_geometry
 
 # =============================================================================
 # COG EXPORT
@@ -224,7 +304,7 @@ def export_masked_sr_band_cogs(
     parent_stack: np.ndarray,
     parent_sr_grid: Dict[str, Any],
     geometry_wgs84: Dict[str, Any],
-    output_dir: str | Path,
+    output_dir: Union[str, Path],
     output_basename: str,
 ) -> Dict[str, Any]:
     """Crops the parent stack exact to polygon geometry, sets NaN, reprojects to 4326, writes COGs."""
@@ -235,11 +315,25 @@ def export_masked_sr_band_cogs(
     transform = parent_sr_grid["transform"]
     src_crs = CRS.from_user_input(parent_sr_grid["crs"])
     
+    geom_wgs84 = normalize_polygonal_geojson_geometry(geometry_wgs84)
+    if geom_wgs84 is None:
+        raise ValueError("Output mask geometry must be polygonal and non-empty.")
+    geom_src = transform_geom(
+        "EPSG:4326",
+        src_crs,
+        geom_wgs84,
+        antimeridian_cutting=True,
+        precision=15,
+    )
+    geom_src = normalize_polygonal_geojson_geometry(geom_src)
+    if geom_src is None:
+        raise ValueError("Transformed output mask geometry is empty in source CRS.")
+
     mask_geom = geometry_mask(
-        [geometry_wgs84],
+        [geom_src],
         out_shape=(parent_sr_grid["height"], parent_sr_grid["width"]),
         transform=transform,
-        invert=True
+        invert=True,
     )
     parent_stack[0, ~mask_geom] = np.nan
     parent_stack[1, ~mask_geom] = np.nan

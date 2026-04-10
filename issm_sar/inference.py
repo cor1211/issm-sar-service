@@ -92,7 +92,7 @@ class SARInferencer:
             else:
                 clean_state_dict[k] = v
 
-        model.load_state_dict(clean_state_dict, strict=True)
+        model.load_state_dict(clean_state_dict, strict=False)
         model.to(self.device)
         model.eval()
         return model

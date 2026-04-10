@@ -6,10 +6,9 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Union, Any, Dict, List, Optional, Tuple
 
 import yaml
-from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +16,7 @@ logger = logging.getLogger(__name__)
 # YAML Loading
 # ---------------------------------------------------------------------------
 
-def load_yaml(path: str | Path) -> Dict[str, Any]:
+def load_yaml(path: Union[str, Path]) -> Dict[str, Any]:
     """Load YAML file and return as dict."""
     path = Path(path)
     if not path.exists():
@@ -26,11 +25,10 @@ def load_yaml(path: str | Path) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def load_config(yaml_path: str | Path) -> Dict[str, Any]:
+def load_config(yaml_path: Union[str, Path]) -> Dict[str, Any]:
     """Load pipeline config with default values for every section."""
     config = load_yaml(yaml_path)
     defaults = {
-        "workflow": {"mode": "stac_trainlike_composite"},
         "stac": {
             "url": "https://earth-search.aws.element84.com/v1",
             "collection": "sentinel-1-grd",
@@ -38,14 +36,9 @@ def load_config(yaml_path: str | Path) -> Dict[str, Any]:
         },
         "pairing": {"pols": "VV,VH", "min_aoi_coverage": 0.0},
         "trainlike": {
-            "selection_strategy": "representative_calendar_period",
-            "period_mode": "month",
-            "period_split_policy": "first_half_vs_second_half",
-            "auto_datetime_strategy": "previous_full_month",
             "auto_datetime_months_back": 1,
             "auto_datetime_timezone": "Asia/Ho_Chi_Minh",
             "min_scenes_per_half": 1,
-            "auto_relax_inside_period": True,
             "component_item_min_coverage": 1.0,
             "component_min_area_ratio": 0.0,
             "target_crs": "EPSG:3857",
@@ -56,9 +49,7 @@ def load_config(yaml_path: str | Path) -> Dict[str, Any]:
         "inference": {"config_path": "config/inference.yaml"},
         "output": {
             "root_dir": "runs",
-            "output_dir_name": "output",
             "save_debug_artifacts": False,
-            "final_resampling": "bilinear",
         },
         "logging": {"level": "INFO"},
     }
@@ -74,16 +65,14 @@ def load_config(yaml_path: str | Path) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _parse_bool(v: str) -> bool:
-    return v.strip().lower() in ("1", "true", "yes")
+    normalized = v.strip().lower()
+    if normalized in ("1", "true", "yes", "y", "on"):
+        return True
+    if normalized in ("0", "false", "no", "n", "off"):
+        return False
+    raise ValueError(f"Invalid boolean value: {v!r}")
 
 _PIPELINE_ENV_MAP: Dict[str, Tuple[str, type]] = {
-    "PIPELINE_STAC_LIMIT": ("stac.limit", int),
-    "PIPELINE_MIN_SCENES_PER_HALF": ("trainlike.min_scenes_per_half", int),
-    "PIPELINE_COMPONENT_ITEM_MIN_COVERAGE": ("trainlike.component_item_min_coverage", float),
-    "PIPELINE_COMPONENT_MIN_AREA_RATIO": ("trainlike.component_min_area_ratio", float),
-    "PIPELINE_TARGET_CRS": ("trainlike.target_crs", str),
-    "PIPELINE_TARGET_RESOLUTION": ("trainlike.target_resolution", float),
-    "PIPELINE_FOCAL_MEDIAN_RADIUS_M": ("trainlike.focal_median_radius_m", float),
     "PIPELINE_SAVE_DEBUG_DATA": ("output.save_debug_artifacts", _parse_bool),
     "STAC_API_URL": ("stac.url", str),
     "STAC_COLLECTION": ("stac.collection", str),
@@ -228,13 +217,11 @@ def resolve_datetime_range(config: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]
 def apply_cli_overrides(config: Dict[str, Any], args: Any) -> None:
     """Merge argparse Namespace values into config dict (only if set)."""
     mapping = {
-        "mode": "workflow.mode",
         "datetime": "stac.datetime",
         "target_crs": "trainlike.target_crs",
         "target_resolution": "trainlike.target_resolution",
         "focal_median_radius_m": "trainlike.focal_median_radius_m",
         "min_aoi_coverage": "pairing.min_aoi_coverage",
-        "auto_datetime_strategy": "trainlike.auto_datetime_strategy",
         "auto_datetime_months_back": "trainlike.auto_datetime_months_back",
         "auto_datetime_timezone": "trainlike.auto_datetime_timezone",
     }

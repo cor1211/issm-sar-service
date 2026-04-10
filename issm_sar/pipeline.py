@@ -6,16 +6,21 @@ import os
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Union, Any, Dict, List, Optional
 
 import numpy as np
 
 from issm_sar.stac_query import (
     STACClient,
+    expand_month_periods,
+    parse_datetime_utc,
+    extract_item_info,
+    apply_hard_filters,
+)
+from issm_sar.stac_geometry import (
     canonical_bbox_from_geometry,
     ensure_polygon_or_multipolygon,
-    expand_month_periods,
-    apply_hard_filters,
+    geodesic_area_wgs84,
     annotate_items_for_aoi,
     build_seed_intersection_region_candidates,
 )
@@ -25,7 +30,9 @@ from issm_sar.preprocessing import (
     apply_focal_median_db,
     build_target_grid,
     export_masked_sr_band_cogs,
+    geometry_mask_for_grid,
     mosaic_component_sr_multibands_to_parent,
+    nanmedian_stack,
     resolve_resampling,
 )
 from issm_sar.inference import SARInferencer
@@ -36,7 +43,8 @@ logger = logging.getLogger(__name__)
 class ISSMSARPipeline:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.inferencer = SARInferencer(config)
+        infer_cfg = config.get("_inference_cfg") if isinstance(config.get("_inference_cfg"), dict) else config
+        self.inferencer = SARInferencer(infer_cfg)
         self.stac_client = STACClient(config["stac"]["url"])
         
         self.target_crs = config["trainlike"]["target_crs"]
@@ -44,19 +52,19 @@ class ISSMSARPipeline:
         self.resampling = resolve_resampling(config["trainlike"]["resampling"])
         self.focal_radius = float(config["trainlike"]["focal_median_radius_m"])
         
-        self.publish_mode = bool(os.getenv("PIPELINE_PUBLISH", "False").lower() in ("true", "1", "yes"))
-        self.s3_output_bucket = os.getenv("S3_OUTPUT_BUCKET", "issm-sar-results")
+        publish_env = os.getenv("WORKFLOW_PUBLISH_ENABLED", "True")
+        self.publish_mode = bool(str(publish_env).strip().lower() in ("true", "1", "yes"))
+        self.s3_output_bucket = os.getenv("SR_S3_BUCKET", "eov-platform-test")
         
         # We need this to ensure we don't pick invalid dB data.
-        self.vmin = float(config.get("normalization", {}).get("v_min", -30.0))
-        self.vmax = float(config.get("normalization", {}).get("v_max", 0.0))
+        self.vmin = -50.0
 
     def run_pipeline_for_aoi(
         self,
         aoi_id: str,
         aoi_geometry: Dict[str, Any],
         datetime_range: str,
-        output_dir: str | Path,
+        output_dir: Union[str, Path],
     ) -> List[Dict[str, Any]]:
         """Run the full pipeline for a specific AOI region.
         
@@ -67,6 +75,35 @@ class ISSMSARPipeline:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         aoi_bbox = canonical_bbox_from_geometry(aoi_geometry)
+        min_scenes_per_half = max(1, int(self.config.get("trainlike", {}).get("min_scenes_per_half", 1)))
+        required_scene_count = min_scenes_per_half
+
+        def _scene_key(item: Dict[str, Any]) -> tuple[str, str, str, str, str]:
+            info = extract_item_info(item)
+            return (
+                str(info.get("datetime") or ""),
+                str(info.get("platform") or ""),
+                str(info.get("orbit_state") or ""),
+                str(info.get("relative_orbit") if info.get("relative_orbit") is not None else ""),
+                str(info.get("slice_number") if info.get("slice_number") is not None else ""),
+            )
+
+        def _dedupe_items_by_scene(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            seen: set[tuple[str, str, str, str, str]] = set()
+            deduped: List[Dict[str, Any]] = []
+            for item in sorted(
+                items,
+                key=lambda it: (
+                    str((it.get("properties") or {}).get("datetime") or ""),
+                    str(it.get("id") or ""),
+                ),
+            ):
+                key = _scene_key(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(item)
+            return deduped
         
         # Ensure we have a shapely polygon
         aoi_shape = ensure_polygon_or_multipolygon(aoi_geometry)
@@ -79,6 +116,7 @@ class ISSMSARPipeline:
         raw_items = self.stac_client.search_items(
             collection=self.config["stac"]["collection"],
             bbox=aoi_bbox,
+            intersects=aoi_geometry,
             datetime_range=datetime_range,
             limit=self.config["stac"]["limit"]
         )
@@ -87,9 +125,16 @@ class ISSMSARPipeline:
         # (Orbit direction is ignored as requested: "không cần quan tâm trường hợp xét riêng ASCENDING hay DESCENDING")
         active_items = apply_hard_filters(raw_items, ["VV", "VH"])
         annotate_items_for_aoi(active_items, aoi_geometry, aoi_bbox)
+
+        min_aoi_coverage = float(self.config.get("pairing", {}).get("min_aoi_coverage", 0.0))
+        active_items = [
+            item for item in active_items
+            if float(item.get("_aoi_coverage", 0.0)) > min_aoi_coverage
+        ]
         
         # 3. Expand into periods
-        periods = expand_month_periods(datetime_range, allow_partial_periods=True)
+        allow_partial_periods = bool(self.config.get("trainlike", {}).get("allow_partial_periods", False))
+        periods = expand_month_periods(datetime_range, allow_partial_periods=allow_partial_periods)
         logger.info("Found %d items. Split into %d monthly periods.", len(active_items), len(periods))
         
         results = []
@@ -97,29 +142,92 @@ class ISSMSARPipeline:
             period_id = period["period_id"]
             logger.info(">>> Processing Period %s", period_id)
             
-            anchor_dt = period["period_anchor_datetime"]
-            
-            # 2. CALENDAR SPLIT (Requirement 2)
-            # Split items strictly into T1 (pre-anchor) and T2 (post-anchor) halves.
-            t1_items = []
-            t2_items = []
+            period_start = parse_datetime_utc(period["period_start"])
+            period_end = parse_datetime_utc(period["period_end"])
+            anchor_dt = parse_datetime_utc(period["period_anchor_datetime"])
+
+            # Split by period boundaries first, then by anchor:
+            # pre: [period_start, anchor), post: [anchor, period_end]
+            pre_items = []
+            post_items = []
             for item in active_items:
-                if item["properties"]["datetime"] < anchor_dt:
-                    t1_items.append(item)
-                else:
-                    t2_items.append(item)
+                try:
+                    item_dt = parse_datetime_utc(str((item.get("properties") or {}).get("datetime") or ""))
+                except ValueError:
+                    continue
+                if period_start <= item_dt < anchor_dt:
+                    pre_items.append(item)
+                elif anchor_dt <= item_dt <= period_end:
+                    post_items.append(item)
                     
-            if not t1_items or not t2_items:
+            if not pre_items or not post_items:
                 logger.warning("Period %s missing either T1 or T2 items. Skipping.", period_id)
                 continue
                 
             # Build candidates intersecting pre and post
-            components = build_seed_intersection_region_candidates(t1_items, t2_items, aoi_geometry)
+            components = build_seed_intersection_region_candidates(
+                pre_items,
+                post_items,
+                aoi_geometry,
+                min_region_coverage=float(
+                    self.config.get("trainlike", {}).get("component_item_min_coverage", 1.0)
+                ),
+                min_region_area_ratio=float(
+                    self.config.get("trainlike", {}).get("component_min_area_ratio", 0.0)
+                ),
+            )
             if not components:
                logger.warning("No overlapping footprint components found for period %s", period_id)
                continue
-               
-            valid_components = components
+
+            # Follow old flow: keep build step as candidate generation; suppress nested only after validity checks.
+            candidate_components = [
+                comp
+                for comp in components
+                if not list(comp.get("reject_reasons", []) or [])
+                and int(comp.get("pre_covering_item_count", 0)) > 0
+                and int(comp.get("post_covering_item_count", 0)) > 0
+            ]
+            if not candidate_components:
+                logger.warning("All component candidates were rejected by region filters for period %s", period_id)
+                continue
+
+            candidate_components.sort(
+                key=lambda comp: float(comp.get("area_ratio_vs_parent", 0.0)),
+                reverse=True,
+            )
+            valid_components: List[Dict[str, Any]] = []
+            for comp in candidate_components:
+                comp_shape = ensure_polygon_or_multipolygon(comp.get("geometry"))
+                comp_area = geodesic_area_wgs84(comp_shape)
+                if comp_shape.is_empty or comp_area <= 0:
+                    continue
+
+                contained = False
+                for kept in valid_components:
+                    kept_shape = ensure_polygon_or_multipolygon(kept.get("geometry"))
+                    if kept_shape.is_empty:
+                        continue
+                    if kept_shape.contains(comp_shape) or kept_shape.covers(comp_shape):
+                        contained = True
+                        break
+
+                    diff_shape = ensure_polygon_or_multipolygon(comp_shape.difference(kept_shape))
+                    diff_area = geodesic_area_wgs84(diff_shape)
+                    if diff_area <= (0.001 * comp_area):
+                        contained = True
+                        break
+
+                if not contained:
+                    valid_components.append(comp)
+
+            if not valid_components:
+                logger.warning("No valid components remained after nested suppression for period %s", period_id)
+                continue
+
+            for idx, comp in enumerate(valid_components, start=1):
+                comp["component_id"] = f"child_{idx:03d}"
+                comp["pair_id"] = f"period_{period_id}__{comp['component_id']}"
             
             child_sr_results = []
             
@@ -131,24 +239,26 @@ class ISSMSARPipeline:
                     logger.info("Processing component %d/%d (Area ratio: %.2f)", idx+1, len(valid_components), comp["area_ratio_vs_parent"])
                     comp_geom = comp["geometry"]
                     comp_bbox = comp["bbox"]
-                    from shapely.geometry import box, shape
-                    comp_shape = shape(comp_geom)
                     
-                    # Find ALL items from T1/T2 that explicitly cover this exact component bounding box
-                    # This achieves the "composite first half vs second half" requested logic
-                    c_t1_items = [i for i in t1_items if shape(box(*i["bbox"])).covers(comp_shape.buffer(-0.0001))]
-                    c_t2_items = [i for i in t2_items if shape(box(*i["bbox"])).covers(comp_shape.buffer(-0.0001))]
-                    
-                    if not c_t1_items or not c_t2_items:
-                        # Fallback rigorously to the original seed permutations if no generic item fully covers it
-                        logger.warning("Component %s lacked full cover list, falling back to seed items.", comp["component_id"])
-                        c_t1_items = [i for i in t1_items if i["id"] == comp["seed_item_ids"][1]]
-                        c_t2_items = [i for i in t2_items if i["id"] == comp["seed_item_ids"][0]]
+                    # Canonical semantics:
+                    # T1 <- post window (later half), T2 <- pre window (earlier half)
+                    c_t1_items = _dedupe_items_by_scene(list(comp.get("post_covering_items") or []))
+                    c_t2_items = _dedupe_items_by_scene(list(comp.get("pre_covering_items") or []))
+
+                    if len(c_t1_items) < required_scene_count or len(c_t2_items) < required_scene_count:
+                        logger.warning(
+                            "Component %s skipped due to insufficient scenes after dedupe (%d/%d required).",
+                            comp["component_id"],
+                            required_scene_count,
+                            required_scene_count,
+                        )
+                        continue
                         
                     logger.info("Component %s compositing %d T1 items and %d T2 items.", comp["component_id"], len(c_t1_items), len(c_t2_items))
                     
                     # Target Grid
                     comp_grid = build_target_grid(comp_bbox, self.target_crs, self.target_res, self.target_res)
+                    comp_valid_mask = geometry_mask_for_grid(comp_geom, comp_grid)
                     
                     def process_pool(pool_items, prefix):
                         debug_files = []
@@ -161,20 +271,31 @@ class ISSMSARPipeline:
                                 download_aoi_subset(i["assets"]["vh"]["href"], p_vh, comp_geom)
                                 if p_vv.exists() and p_vh.exists():
                                     debug_files.extend([p_vv, p_vh])
-                                    a_vv = align_single_band_to_grid(p_vv, comp_grid, self.resampling, valid_min_db=self.vmin, valid_max_db=self.vmax, valid_geometry=comp_geom)
-                                    a_vh = align_single_band_to_grid(p_vh, comp_grid, self.resampling, valid_min_db=self.vmin, valid_max_db=self.vmax, valid_geometry=comp_geom)
+                                    a_vv = align_single_band_to_grid(
+                                        p_vv,
+                                        comp_grid,
+                                        self.resampling,
+                                        valid_min_db=self.vmin,
+                                    )
+                                    a_vh = align_single_band_to_grid(
+                                        p_vh,
+                                        comp_grid,
+                                        self.resampling,
+                                        valid_min_db=self.vmin,
+                                    )
                                     vv_arrs.append(a_vv)
                                     vh_arrs.append(a_vh)
                             except Exception as e:
                                 logger.warning("Failed processing item %s: %s", i["id"], e)
                         
                         if not vv_arrs: return None, None, debug_files
-                        # COMPOSITE (Tổng hợp) nanmedian
-                        import warnings
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", category=RuntimeWarning)
-                            merged_vv = np.nanmedian(np.stack(vv_arrs, axis=0), axis=0)
-                            merged_vh = np.nanmedian(np.stack(vh_arrs, axis=0), axis=0)
+                        # COMPOSITE (Tổng hợp) nanmedian including spatial fallback for NaNs
+                        try:
+                            merged_vv = nanmedian_stack(vv_arrs)
+                            merged_vh = nanmedian_stack(vh_arrs)
+                        except RuntimeError as e:
+                            logger.warning("Component composite became all-NaN for pool %s: %s", prefix, e)
+                            return None, None, debug_files
                         return merged_vv, merged_vh, debug_files
                         
                     # 1 & 2. Download, Align, Mask, Composite
@@ -190,6 +311,12 @@ class ISSMSARPipeline:
                     f_t1_vh = apply_focal_median_db(a_t1_vh, self.focal_radius, self.target_res)
                     f_t2_vv = apply_focal_median_db(a_t2_vv, self.focal_radius, self.target_res)
                     f_t2_vh = apply_focal_median_db(a_t2_vh, self.focal_radius, self.target_res)
+
+                    # Keep train-like order: align -> nanmedian -> focal -> geometry mask.
+                    f_t1_vv[~comp_valid_mask] = np.nan
+                    f_t1_vh[~comp_valid_mask] = np.nan
+                    f_t2_vv[~comp_valid_mask] = np.nan
+                    f_t2_vh[~comp_valid_mask] = np.nan
                     
                     # 4. Infer
                     t1_stack = np.stack([f_t1_vv, f_t1_vh], axis=0)
@@ -233,7 +360,7 @@ class ISSMSARPipeline:
                     continue
                     
                 logger.info("Mosaicing %d child components to parent...", len(child_sr_results))
-                parent_stack, parent_grid = mosaic_component_sr_multibands_to_parent(
+                parent_stack, parent_grid, supported_geometry = mosaic_component_sr_multibands_to_parent(
                     component_sources=child_sr_results,
                     parent_aoi_bbox=aoi_bbox,
                     target_crs=self.target_crs,
@@ -242,7 +369,8 @@ class ISSMSARPipeline:
                 
                 # C: Export COG
                 basename = f"SR_AOI_{aoi_id}_{period_id}"
-                cogs = export_masked_sr_band_cogs(parent_stack, parent_grid, aoi_geometry, output_dir, basename)
+                export_geometry = supported_geometry if supported_geometry is not None else aoi_geometry
+                cogs = export_masked_sr_band_cogs(parent_stack, parent_grid, export_geometry, output_dir, basename)
                 
                 vv_cog = cogs["output_sr_vv_tif"]
                 vh_cog = cogs["output_sr_vh_tif"]
@@ -273,15 +401,17 @@ class ISSMSARPipeline:
                     vh_s3_uri = f"s3://{self.s3_output_bucket}/{vh_s3_key}"
                     
                     # 2. Upload to S3
-                    upload_to_s3(vv_cog, vv_s3_uri)
-                    upload_to_s3(vh_cog, vh_s3_uri)
+                    if not upload_to_s3(vv_cog, vv_s3_uri):
+                        raise RuntimeError(f"Failed to upload VV COG to {vv_s3_uri}")
+                    if not upload_to_s3(vh_cog, vh_s3_uri):
+                        raise RuntimeError(f"Failed to upload VH COG to {vh_s3_uri}")
                     
                     # 3. Create STAC Item
                     stac_item = create_stac_item(
                         item_id=item_id,
                         vv_s3_uri=vv_s3_uri,
                         vh_s3_uri=vh_s3_uri,
-                        geometry=aoi_geometry,
+                        geometry=export_geometry,
                         period_start=period["period_start"],
                         period_end=period["period_end"],
                         gsd=cogs["gsd"],
@@ -289,7 +419,8 @@ class ISSMSARPipeline:
                     )
                     
                     # 4. POST to metadata server
-                    publish_stac_item(stac_item, "issm-sar-sr-test")
+                    if not publish_stac_item(stac_item, collection_name):
+                        raise RuntimeError(f"Failed to publish STAC item {item_id}")
                     logger.info("Publishing completed for %s", item_id)
                     
                 results.append(cogs)
